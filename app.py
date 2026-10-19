@@ -4,7 +4,6 @@ Interactive Image Viewer, and Analysis History (PRD Version 2.0).
 Includes Dual-Mode Session Management so authentication works seamlessly both
 in standalone browsers and inside cross-origin preview iframes that block cookies.
 """
-import json
 import os
 import re
 from functools import wraps
@@ -22,6 +21,7 @@ from flask import (
     abort,
 )
 from io import BytesIO
+from sqlalchemy import text
 from werkzeug.exceptions import RequestEntityTooLarge
 from config import Config
 from models import db, User, Analysis, ChatMessage
@@ -38,6 +38,9 @@ def create_app(test_config: dict = None) -> Flask:
     if test_config:
         app.config.update(test_config)
 
+    if app.config.get("APP_ENV") == "production" and not app.config.get("SECRET_KEY"):
+        raise RuntimeError("FLASK_SECRET_KEY must be configured in production.")
+
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["SAMPLE_FOLDER"], exist_ok=True)
 
@@ -53,21 +56,9 @@ def create_app(test_config: dict = None) -> Flask:
         session.clear()
         session["user_id"] = user_obj.user_id
         session["user_name"] = user_obj.name
-        if not app.config.get("TESTING", False):
-            try:
-                with open(app.config["ACTIVE_SESSION_FILE"], "w", encoding="utf-8") as f:
-                    json.dump({"active_user_id": user_obj.user_id}, f)
-            except OSError:
-                pass
 
     def _clear_active_user() -> None:
         session.clear()
-        if not app.config.get("TESTING", False):
-            try:
-                with open(app.config["ACTIVE_SESSION_FILE"], "w", encoding="utf-8") as f:
-                    json.dump({"active_user_id": None}, f)
-            except OSError:
-                pass
 
     def get_current_user():
         uid = session.get("user_id")
@@ -76,20 +67,6 @@ def create_app(test_config: dict = None) -> Flask:
             if user:
                 return user
 
-        # Fallback for cross-origin preview iframes where Chrome blocks 3rd-party cookies
-        if not app.config.get("TESTING", False):
-            session_file = app.config.get("ACTIVE_SESSION_FILE")
-            if session_file and os.path.exists(session_file):
-                try:
-                    with open(session_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    fallback_uid = data.get("active_user_id")
-                    if fallback_uid:
-                        user = db.session.get(User, int(fallback_uid))
-                        if user:
-                            return user
-                except Exception:
-                    pass
         return None
 
     def _seed_starter_study_for_new_user(user_obj: User) -> None:
@@ -146,18 +123,6 @@ def create_app(test_config: dict = None) -> Flask:
 
         return wrapped_view
 
-    @app.after_request
-    def add_partitioned_cookie_header(response):
-        """Adds Partitioned attribute to Set-Cookie for Chrome CHIPS cross-site iframe support."""
-        cookies = response.headers.getlist("Set-Cookie")
-        if cookies:
-            response.headers.pop("Set-Cookie", None)
-            for cookie in cookies:
-                if "SameSite=None" in cookie and "Partitioned" not in cookie:
-                    cookie = f"{cookie}; Partitioned"
-                response.headers.add("Set-Cookie", cookie)
-        return response
-
     @app.context_processor
     def inject_globals():
         user = get_current_user()
@@ -210,6 +175,15 @@ def create_app(test_config: dict = None) -> Flask:
     # -------------------------------------------------------------------------
     # Public & Authentication Routes (FR-01, FR-02)
     # -------------------------------------------------------------------------
+    @app.route("/healthz")
+    def health_check():
+        try:
+            db.session.execute(text("SELECT 1"))
+            return jsonify({"status": "ok"})
+        except Exception:
+            db.session.rollback()
+            return jsonify({"status": "unavailable"}), 503
+
     @app.route("/")
     def index():
         if get_current_user():
@@ -285,24 +259,6 @@ def create_app(test_config: dict = None) -> Flask:
 
             user = User.query.filter_by(email=email).first()
 
-            # In interactive mode (not unit testing), if the user types demo@radiology-ai.edu with any password,
-            # or types a brand-new email on the Sign In screen, smoothly sign them in!
-            if not app.config.get("TESTING", False):
-                if user is not None and email == "demo@radiology-ai.edu":
-                    _set_active_user(user)
-                    flash(f"Signed in as {user.name}.", "success")
-                    return redirect(url_for("dashboard"))
-                if user is None and "@" in email and len(password) >= 4:
-                    inferred_name = email.split("@")[0].replace(".", " ").replace("_", " ").title()
-                    user = User(name=inferred_name, email=email)
-                    user.set_password(password)
-                    db.session.add(user)
-                    db.session.commit()
-                    _seed_starter_study_for_new_user(user)
-                    _set_active_user(user)
-                    flash(f"Welcome, {user.name}! Your account was created and signed in.", "success")
-                    return redirect(url_for("dashboard"))
-
             if user is None or not user.check_password(password):
                 flash("Invalid email address or password. Please check your credentials and try again.", "danger")
                 return render_template("auth.html", mode="login", form_email=email), 401
@@ -316,12 +272,16 @@ def create_app(test_config: dict = None) -> Flask:
     @app.route("/demo-login", methods=["POST", "GET"])
     def demo_login():
         """One-click evaluator login into the pre-seeded demo account."""
+        if not app.config.get("ENABLE_DEMO_ACCESS"):
+            abort(404)
         role = request.values.get("demo_role", "evaluator")
         target_email = "student@radiology-ai.edu" if role == "student" else "demo@radiology-ai.edu"
         user = User.query.filter_by(email=target_email).first()
         if not user:
             seed_initial_data(app)
             user = User.query.filter_by(email=target_email).first()
+        if user is None:
+            abort(404)
         _set_active_user(user)
         flash(f"Signed in with Demo Account: {user.name}", "info")
         return redirect(url_for("dashboard"))

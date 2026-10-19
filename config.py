@@ -33,22 +33,25 @@ def build_database_uri() -> str:
 
 
 class Config:
-    SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "thorax-ai-clinical-workspace-prd-v2-secret-2026")
+    APP_ENV = os.environ.get("APP_ENV", "development").lower()
+    SECRET_KEY = os.environ.get(
+        "FLASK_SECRET_KEY",
+        None if APP_ENV == "production" else "thorax-ai-local-development-only",
+    )
+    ENABLE_DEMO_ACCESS = os.environ.get("ENABLE_DEMO_ACCESS", "true").lower() in {"1", "true", "yes"}
     SQLALCHEMY_DATABASE_URI = build_database_uri()
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
     }
 
-    # Cross-origin iframe cookie compatibility
-    SESSION_COOKIE_SAMESITE = "None"
-    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_SECURE = APP_ENV == "production"
     SESSION_COOKIE_HTTPONLY = True
 
     # Upload & Image Validation Settings (FR-03, Section 7 Security)
     UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
     SAMPLE_FOLDER = os.path.join(BASE_DIR, "static", "samples")
-    ACTIVE_SESSION_FILE = os.path.join(INSTANCE_DIR, "active_session.json")
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB max file upload
     ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 
