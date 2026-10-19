@@ -18,8 +18,10 @@ from flask import (
     flash,
     jsonify,
     send_from_directory,
+    send_file,
     abort,
 )
+from io import BytesIO
 from werkzeug.exceptions import RequestEntityTooLarge
 from config import Config
 from models import db, User, Analysis, ChatMessage
@@ -107,6 +109,8 @@ def create_app(test_config: dict = None) -> Flask:
                 user_id=user_obj.user_id,
                 image_path=prep["image_rel_path"],
                 processed_image_path=prep["processed_rel_path"],
+                original_image_bytes=prep["orig_bytes"],
+                processed_image_bytes=prep["proc_bytes"],
                 case_label=gen["case_label"],
                 generated_report=gen["report_text"],
                 status="completed",
@@ -188,6 +192,10 @@ def create_app(test_config: dict = None) -> Flask:
     def handle_not_found(e):
         if request.path.startswith("/api/"):
             return jsonify({"error": "The requested analysis record or resource could not be found."}), 404
+        # Browsers and crawlers probe for asset paths (e.g. /favicon.ico);
+        # a missing asset must not flash a warning banner on the page.
+        if request.path.startswith("/static") or request.accept_mimetypes.best != "text/html":
+            return "Not found", 404
         flash("The requested page or analysis record could not be found.", "warning")
         return redirect(url_for("dashboard") if get_current_user() else url_for("login")), 404
 
@@ -411,6 +419,15 @@ def create_app(test_config: dict = None) -> Flask:
         if analysis.user_id != user.user_id:
             abort(403)
 
+        # Cloud-first: serve the image bytes stored in the database.
+        # Built-in samples (and any legacy local rows) fall back to the file.
+        if analysis.original_image_bytes:
+            mimetype = "image/png" if (analysis.image_path or "").lower().endswith(".png") else "image/jpeg"
+            return send_file(
+                BytesIO(analysis.original_image_bytes),
+                mimetype=mimetype,
+                download_name=os.path.basename(analysis.image_path),
+            )
         rel_path = analysis.image_path
         static_root = os.path.join(app.root_path, "static")
         full_path = os.path.join(static_root, rel_path)
@@ -429,6 +446,14 @@ def create_app(test_config: dict = None) -> Flask:
         if analysis.user_id != user.user_id:
             abort(403)
 
+        # Cloud-first: serve the stored CLAHE bytes (original bytes as fallback).
+        proc_blob = analysis.processed_image_bytes or analysis.original_image_bytes
+        if proc_blob:
+            return send_file(
+                BytesIO(proc_blob),
+                mimetype="image/png",
+                download_name=os.path.basename(analysis.processed_image_path or analysis.image_path),
+            )
         rel_path = analysis.processed_image_path or analysis.image_path
         static_root = os.path.join(app.root_path, "static")
         full_path = os.path.join(static_root, rel_path)
@@ -489,6 +514,8 @@ def create_app(test_config: dict = None) -> Flask:
                 user_id=user.user_id,
                 image_path=prep["image_rel_path"],
                 processed_image_path=prep["processed_rel_path"],
+                original_image_bytes=prep["orig_bytes"],
+                processed_image_bytes=prep["proc_bytes"],
                 case_label=gen_result["case_label"],
                 generated_report=gen_result["report_text"],
                 status="completed",
